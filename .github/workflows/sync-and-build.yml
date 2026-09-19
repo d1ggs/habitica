@@ -1,0 +1,107 @@
+# Added on top of awinterstein/habitica (upstream of this fork).
+# Nightly: reset this branch onto upstream/self-host, re-apply this one
+# file, then build the server image for linux/arm64 (Raspberry Pi 5) and
+# push it to GHCR.
+#
+# Why reset instead of merge: upstream periodically REBASES its self-host
+# branch onto HabitRPG/habitica's release branch (their own Rebase Upstream
+# workflow), rewriting every commit's SHA. A three-way `git merge` against a
+# rewritten history compares our old copy of upstream's self-hosting patches
+# (analytics/payments disabling, etc.) against upstream's new copy of the
+# *same* patches under new SHAs — git sees that as a real content conflict,
+# not just a history mismatch, and it happens on every successful upstream
+# rebase (first hit 2026-08-31, log: "CONFLICT (content): Merge conflict in
+# website/client/src/libs/payments.js"). This fork adds nothing but this one
+# workflow file, so there's nothing to preserve except this file — resetting
+# straight to upstream's tip sidesteps the conflict entirely by construction.
+name: Sync & Build
+
+on:
+  schedule:
+    - cron: "38 2 * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - self-host
+    paths:
+      - ".github/workflows/sync-and-build.yml"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: sync-and-build
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.sync.outputs.updated }}
+      sha: ${{ steps.sync.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: self-host
+          fetch-depth: 0
+          # No partial-clone filter: a missing object needed while reading
+          # the old blob below (git checkout "$BEFORE" -- <path>) would
+          # otherwise be lazily fetched from origin only, which may not
+          # have it right after a reset.
+      - name: Sync to upstream self-host
+        id: sync
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/awinterstein/habitica.git
+          git fetch upstream self-host
+          BEFORE=$(git rev-parse HEAD)
+          git reset --hard upstream/self-host
+          git checkout "$BEFORE" -- .github/workflows/sync-and-build.yml
+          git add .github/workflows/sync-and-build.yml
+          if ! git diff --cached --quiet; then
+            git commit -m "Re-apply sync-and-build.yml on top of upstream/self-host"
+          fi
+          AFTER=$(git rev-parse HEAD)
+          if [ "$BEFORE" != "$AFTER" ]; then
+            git push --force-with-lease origin self-host
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "sha=$AFTER" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: sync
+    # Scheduled runs only build when upstream moved; manual dispatch and
+    # workflow edits always build.
+    if: needs.sync.outputs.updated == 'true' || github.event_name != 'schedule'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute image tag
+        id: tag
+        # Unix timestamp prefix keeps tags sortable for Flux's numerical
+        # ImagePolicy; short SHA ties the image back to the commit.
+        run: echo "tag=self-host-$(date +%s)-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: server
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/habitica-server:${{ steps.tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/habitica-server:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/habitica-server:buildcache
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/habitica-server:buildcache,mode=max
